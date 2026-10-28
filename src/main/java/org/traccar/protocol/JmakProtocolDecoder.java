@@ -59,6 +59,13 @@ public class JmakProtocolDecoder extends BaseProtocolDecoder {
         }
 
         String sentence = buf.toString(StandardCharsets.US_ASCII);
+        if (sentence.startsWith("*")) {
+            return decodeSummary(channel, remoteAddress, sentence);
+        }
+
+        if (sentence.startsWith("$")) {
+            return decodeResult(channel, remoteAddress, sentence);
+        }
 
         if (!sentence.startsWith("~") || !sentence.endsWith("$")) {
             return null;
@@ -646,6 +653,82 @@ public class JmakProtocolDecoder extends BaseProtocolDecoder {
         }
 
         sendResponse(channel, remoteAddress);
+
+        return position;
+    }
+
+    private Object decodeSummary(Channel channel, SocketAddress remoteAddress, String sentence) {
+
+        String[] values = sentence.substring(1, sentence.length() - 1).split(";");
+
+        int index = 0;
+        long mask = Long.parseLong(values[index++], 16);
+
+        DeviceSession deviceSession = getDeviceSession(channel, remoteAddress, values[index++]);
+        if (deviceSession == null) {
+            return null;
+        }
+
+        Position position = new Position(getProtocolName());
+        position.setDeviceId(deviceSession.getDeviceId());
+
+        index += 1; // serial number
+        position.set("tripId", Long.parseLong(values[index++]));
+        position.set(Position.KEY_ARCHIVE, Integer.parseInt(values[index++]) > 0);
+        decodeDriver(position, values[index++]);
+
+        position.set("tripStart", Long.parseLong(values[index++]));
+        long tripEnd = Long.parseLong(values[index++]);
+        position.set("tripEnd", tripEnd);
+
+        position.setValid(true);
+        position.setTime(new Date(tripEnd));
+        index += 1; // start latitude
+        position.setLatitude(Double.parseDouble(values[index++]));
+        index += 1; // start longitude
+        position.setLongitude(Double.parseDouble(values[index++]));
+        index += 1; // flags
+
+        double odometerStart = Double.parseDouble(values[index++]);
+        double odometerEnd = Double.parseDouble(values[index++]);
+        position.set(Position.KEY_ODOMETER, odometerEnd * 1000);
+        position.set(Position.KEY_ODOMETER_TRIP, (odometerEnd - odometerStart) * 1000);
+
+        double hoursStart = Double.parseDouble(values[index++]);
+        double hoursEnd = Double.parseDouble(values[index++]);
+        position.set(Position.KEY_HOURS, UnitsConverter.msFromHours(hoursEnd));
+        position.set("tripHours", UnitsConverter.msFromHours(hoursEnd - hoursStart));
+
+        if (BitUtil.check(mask, 17) && !values[index + 1].contains(":")) {
+            double fuelStart = Double.parseDouble(values[index++]);
+            double fuelEnd = Double.parseDouble(values[index++]);
+            if (fuelEnd > 0) {
+                position.set(Position.KEY_FUEL_USED, fuelEnd);
+                position.set("tripFuelUsed", fuelEnd - fuelStart);
+            }
+            if (BitUtil.check(mask, 20)) {
+                position.set("tripFuelUsed", Double.parseDouble(values[values.length - 1]));
+            }
+        }
+
+        sendResponse(channel, remoteAddress);
+
+        return position;
+    }
+
+    private Object decodeResult(Channel channel, SocketAddress remoteAddress, String sentence) {
+
+        DeviceSession deviceSession = getDeviceSession(channel, remoteAddress);
+        if (deviceSession == null) {
+            return null;
+        }
+
+        Position position = new Position(getProtocolName());
+        position.setDeviceId(deviceSession.getDeviceId());
+
+        getLastLocation(position, null);
+
+        position.set(Position.KEY_RESULT, sentence);
 
         return position;
     }
