@@ -28,6 +28,13 @@ import org.traccar.helper.UnitsConverter;
 import org.traccar.model.Position;
 import org.traccar.session.DeviceSession;
 
+import jakarta.json.Json;
+import jakarta.json.JsonArray;
+import jakarta.json.JsonNumber;
+import jakarta.json.JsonObject;
+import jakarta.json.JsonString;
+import jakarta.json.JsonValue;
+import java.io.StringReader;
 import java.net.SocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.util.Date;
@@ -47,11 +54,11 @@ public class JmakProtocolDecoder extends BaseProtocolDecoder {
             return decodeBinary(channel, remoteAddress, buf);
         }
 
-        String sentence = buf.toString(StandardCharsets.US_ASCII);
-        if (sentence.startsWith("{")) {
-            sendResponse(channel, remoteAddress);
-            return null;
+        if (buf.getByte(buf.readerIndex()) == '{') {
+            return decodeJson(channel, remoteAddress, buf.toString(StandardCharsets.UTF_8));
         }
+
+        String sentence = buf.toString(StandardCharsets.US_ASCII);
 
         if (!sentence.startsWith("~") || !sentence.endsWith("$")) {
             return null;
@@ -526,6 +533,116 @@ public class JmakProtocolDecoder extends BaseProtocolDecoder {
 
         if (buf.readableBytes() > 1) {
             decodeCan(position, buf);
+        }
+
+        sendResponse(channel, remoteAddress);
+
+        return position;
+    }
+
+    private void decodeCan(Position position, JsonObject can) {
+        for (String key : can.keySet()) {
+            int id = Integer.parseInt(key);
+            int index = switch (id) {
+                case 1 -> 2;
+                case 2 -> 3;
+                case 3 -> 0;
+                case 4 -> 8;
+                case 5 -> 14;
+                case 6 -> 6;
+                case 7 -> 4;
+                case 9 -> 10;
+                case 10 -> 12;
+                case 11 -> 1;
+                case 14 -> 13;
+                case 40 -> 38;
+                default -> id >= 16 && id <= 38 ? id - 1 : -1;
+            };
+            if (index < 0) {
+                continue;
+            }
+            JsonValue value = can.get(key);
+            if (value instanceof JsonString string) {
+                String data = string.getString();
+                char first = data.charAt(0);
+                int unit = Character.isDigit(first) || first == '-' ? 0 : first;
+                double number = Double.parseDouble(unit > 0 ? data.substring(1) : data);
+                decodeCanValue(position, index, number, unit);
+            } else if (value instanceof JsonNumber number) {
+                decodeCanValue(position, index, number.doubleValue(), 0);
+            }
+        }
+    }
+
+    private Object decodeJson(Channel channel, SocketAddress remoteAddress, String sentence) {
+
+        JsonObject root = Json.createReader(new StringReader(sentence)).readObject();
+
+        DeviceSession deviceSession = getDeviceSession(
+                channel, remoteAddress, root.getJsonNumber("imei").toString());
+        if (deviceSession == null) {
+            return null;
+        }
+
+        Position position = new Position(getProtocolName());
+        position.setDeviceId(deviceSession.getDeviceId());
+
+        position.set(Position.KEY_INDEX, root.getJsonNumber("cnt").longValue());
+        position.set("nickname", root.getString("name", null));
+
+        position.setValid(root.getInt("fix") > 0);
+        position.setTime(new Date(root.getJsonNumber("ts").longValue()));
+        position.setDeviceTime(new Date(root.getJsonNumber("ts_n").longValue()));
+
+        JsonArray coordinates = root.getJsonArray("gps");
+        position.setLatitude(coordinates.getJsonNumber(0).doubleValue());
+        position.setLongitude(coordinates.getJsonNumber(1).doubleValue());
+        position.setAltitude(root.getJsonNumber("alt").doubleValue());
+        position.setSpeed(UnitsConverter.knotsFromKph(root.getJsonNumber("speed").doubleValue()));
+        position.setCourse(root.getJsonNumber("azi").doubleValue());
+
+        position.set(Position.KEY_SATELLITES, root.getInt("nsat"));
+        position.set(Position.KEY_HDOP, root.getJsonNumber("hdop").doubleValue());
+        position.set(Position.KEY_RSSI, root.getInt("rssi"));
+        position.set(Position.KEY_OPERATOR, root.getString("ope"));
+        position.set(Position.KEY_IGNITION, root.getInt("ive") > 0);
+        position.set(Position.KEY_ARCHIVE, root.getInt("bckup") > 0);
+        position.set(Position.KEY_HOURS, UnitsConverter.msFromHours(root.getJsonNumber("hourmt").doubleValue()));
+        position.set(Position.KEY_ODOMETER, root.getJsonNumber("odomt").doubleValue() * 1000);
+        position.set(Position.KEY_POWER, root.getInt("vin") / 1000.0);
+        position.set(Position.KEY_BATTERY, root.getInt("bat") / 1000.0);
+
+        if (root.containsKey("ios")) {
+            position.set(Position.KEY_STATUS, root.getInt("ios"));
+        }
+        decodeDriver(position, root.getJsonNumber("tag").toString());
+
+        JsonObject event = root.getJsonObject("evt");
+        if (event.containsKey("id")) {
+            Integer status = event.containsKey("st") ? event.getInt("st") : null;
+            decodeEvent(position, event.getInt("id"), status, event.getString("name", null));
+        }
+
+        if (root.containsKey("anin")) {
+            position.set(Position.PREFIX_ADC + 1, root.getJsonNumber("anin").doubleValue());
+        }
+
+        position.set("message", root.getString("trp", null));
+
+        String version = root.getString("ver", "");
+        if (!version.isEmpty()) {
+            position.set(Position.KEY_VERSION_FW, decodeVersion(
+                    Unpooled.wrappedBuffer(DataConverter.parseHex(version))));
+        }
+
+        position.set("model", root.getString("mod", null));
+
+        if (root.containsKey("trp_id")) {
+            position.set("tripId", root.getJsonNumber("trp_id").longValue());
+        }
+
+        if (root.containsKey("can")) {
+            decodeCan(position, root.getJsonObject("can"));
         }
 
         sendResponse(channel, remoteAddress);
